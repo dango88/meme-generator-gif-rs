@@ -1,0 +1,31 @@
+[package]
+name = "meme_gif_pack"
+description = "GIF tools as memes: reverse / speed / mirror / text — a meme-generator-rs external pack"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/dango88/meme-generator-gif-rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 只依赖 core：它只有 chrono/serde/directories/tracing 四个轻依赖。
+# 刻意不依赖 meme_generator_utils —— 那边拖 skia-safe + gifski（数百 MB 编译），
+# 而本包只需要「把原始字节读进来 → 逐帧处理 → 写回去」，用 gif crate 更直接，
+# 也能精确保留每帧自己的 delay（gifski/框架的 GifEncoder 会把帧对齐成统一间隔）。
+meme_generator_core = "0.0.5"
+# MemeInfo 的字段类型就是 chrono 的时间，构造 info() 时必须用同一个 crate，
+# 所以这里是直接依赖而不是传递依赖。
+chrono = "0.4"
+gif = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ab_glyph = "0.2"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+# 刻意不设 panic = "abort"：本包被宿主进程 dlopen 进来，abort 会让整个
+# 2233 服务跟着死。让 panic 正常 unwind，再由 lib.rs 的 catch_unwind 兜住。

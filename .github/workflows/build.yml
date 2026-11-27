@@ -1,0 +1,158 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    # 注意：branches 与 tags 同时列时，打 tag 会命中 tags 规则；
+    # 但从 main 推普通 commit 只命中 branches。两者不会叠加触发两次。
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "src/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # 必须固定与宿主相同的 rustc 版本。
+  #
+  # 这是一个 cdylib，宿主 dlopen 之后会直接调用我们导出的
+  # MEME_PACK_DECLARATION.register，传入 &mut dyn MemeRegistry、
+  # 再传 Box<dyn Meme> 进去 —— 全靠 Rust 的 trait object 内存布局。
+  # rustc 主版本之间这个布局不保证兼容：用 1.100 编译、宿主是 1.94 时，
+  # 一调用就 SIGSEGV（实测容器崩溃重启）。
+  #
+  # 升级这里之前，先确认宿主二进制是用哪个 rustc 编的：
+  #   readelf -p .comment <宿主二进制>
+  # 不匹配时宿主只会打印 warn 然后继续加载，不会拒绝，所以必须自己盯住。
+  RUST_VERSION: "1.94.1"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --release
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            ext: so
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-aarch64
+            ext: so
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            ext: dll
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+            ext: dylib
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-aarch64
+            ext: dylib
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Collect library
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Linux/macOS 产物带 lib 前缀，Windows 是纯 xxx.dll
+          find "target/${{ matrix.target }}/release" -maxdepth 1 \
+            -name "*.${{ matrix.ext }}" -exec cp {} dist/ \;
+          # 统一改名成带平台标识，避免五个同名文件混在一起分不清
+          cd dist
+          for f in *; do
+            base="${f%.*}"
+            ext="${f##*.}"
+            # 去掉可能存在的 lib 前缀，再拼上平台标识
+            base="${base#lib}"
+            mv "$f" "${base}-${{ matrix.label }}.${ext}"
+          done
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meme-generator-gif-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+          # 只留 3 天。历史产物是会过期的临时下载件，长期版本走 Release。
+          retention-days: 3
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p out
+          find artifacts -type f -exec cp {} out/ \;
+          ls -lh out/
+
+      # 只保留最新版 Release：删掉除当前 tag 之外的全部 release 与 tag。
+      # 这样 Release 页面永远只有一条，不会被历史版本堆满。
+      - name: Delete older releases and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          echo "保留: $CURRENT_TAG"
+          # 删 release
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+                       --json tagName --jq '.[].tagName'); do
+            if [ "$tag" != "$CURRENT_TAG" ]; then
+              echo "删除旧 release: $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+            fi
+          done
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ github.ref_name }}" \
+            --notes "构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，rustc ${{ env.RUST_VERSION }}"
